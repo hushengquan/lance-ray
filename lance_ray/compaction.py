@@ -4,9 +4,10 @@ from typing import Any, Optional
 import lance
 from lance.lance import CompactionMetrics
 from lance.optimize import Compaction, CompactionOptions, CompactionTask
-from ray.util.multiprocessing import Pool
 
+from .index import _map_async_with_pool
 from .utils import (
+    array_split,
     create_storage_options_provider,
     get_or_create_namespace,
     validate_uri_or_namespace,
@@ -23,56 +24,67 @@ def _handle_compaction_task(
     table_id: Optional[list[str]] = None,
 ):
     """
-    Create a function to handle compaction task execution for use with Pool.
-    This function returns a callable that can be used with Pool.map_async
-    to execute compaction tasks.
+    Create a function to handle a batch of compaction tasks for use with Pool.
+    The returned callable opens the dataset once per worker invocation and
+    executes all tasks in the batch sequentially, avoiding repeated dataset
+    open overhead.
     """
 
-    def func(task: CompactionTask) -> dict[str, Any]:
+    def func(tasks: list[CompactionTask]) -> dict[str, Any]:
         """
-        Execute a compaction task.
+        Execute a batch of compaction tasks on a single dataset connection.
 
         Args:
-            task: CompactionTask to execute
+            tasks: List of CompactionTask objects to execute.
 
         Returns:
-            Dictionary with status and result information
+            Dictionary with status and result information.
         """
-        try:
-            # Create storage options provider in worker for credentials refresh
-            storage_options_provider = create_storage_options_provider(
-                namespace_impl, namespace_properties, table_id
-            )
+        # Create storage options provider in worker for credentials refresh
+        storage_options_provider = create_storage_options_provider(
+            namespace_impl, namespace_properties, table_id
+        )
 
-            # Load dataset
-            dataset = lance.LanceDataset(
-                dataset_uri,
-                storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
-            )
+        # Open dataset once for the entire batch
+        dataset = lance.LanceDataset(
+            dataset_uri,
+            storage_options=storage_options,
+            storage_options_provider=storage_options_provider,
+        )
 
-            logger.info(f"Executing compaction task for fragments {task.fragments}")
+        results = []
+        errors = []
+        for task in tasks:
+            try:
+                logger.info(
+                    "Executing compaction task for fragments %s", task.fragments
+                )
+                result = task.execute(dataset)
+                logger.info(
+                    "Compaction task completed for fragments %s", task.fragments
+                )
+                results.append(result)
+            except Exception as e:
+                logger.error(
+                    "Compaction task failed for fragments %s: %s",
+                    task.fragments,
+                    e,
+                )
+                errors.append(
+                    {"fragments": task.fragments, "error": str(e)}
+                )
 
-            # Execute the compaction task
-            result = task.execute(dataset)
-
-            logger.info(
-                f"Compaction task completed successfully for fragments {task.fragments}"
-            )
-
-            return {
-                "status": "success",
-                "fragments": task.fragments,
-                "result": result,
-            }
-
-        except Exception as e:
-            logger.error(f"Compaction task failed for fragments {task.fragments}: {e}")
+        if errors:
             return {
                 "status": "error",
-                "fragments": task.fragments,
-                "error": str(e),
+                "results": results,
+                "errors": errors,
             }
+
+        return {
+            "status": "success",
+            "results": results,
+        }
 
     return func
 
@@ -157,14 +169,16 @@ def compact_files(
         return None
 
     # Adjust num_workers if needed
-    if num_workers > compaction_plan.num_tasks():
-        num_workers = compaction_plan.num_tasks()
-        logger.info(f"Adjusted num_workers to {num_workers} to match task count")
+    num_tasks = compaction_plan.num_tasks()
+    if num_workers > num_tasks:
+        num_workers = num_tasks
+        logger.info("Adjusted num_workers to %d to match task count", num_workers)
 
-    # Step 2: Execute tasks in parallel using Ray Pool
-    pool = Pool(processes=num_workers, ray_remote_args=ray_remote_args)
+    # Split tasks into batches so each worker processes multiple tasks on
+    # a single dataset connection, reducing repeated dataset open overhead
+    task_batches = array_split(compaction_plan.tasks, num_workers)
 
-    # Create the task handler function
+    # Step 2: Execute task batches in parallel using Ray Pool
     task_handler = _handle_compaction_task(
         dataset_uri=uri,
         storage_options=merged_storage_options,
@@ -173,33 +187,29 @@ def compact_files(
         table_id=table_id,
     )
 
-    # Submit tasks using Pool.map_async
-    rst_futures = pool.map_async(
-        task_handler,
-        compaction_plan.tasks,
-        chunksize=1,
+    results = _map_async_with_pool(
+        fragment_handler=task_handler,
+        fragment_batches=task_batches,
+        num_workers=num_workers,
+        ray_remote_args=ray_remote_args,
+        error_prefix="Failed to complete distributed compaction",
     )
-
-    # Wait for results
-    try:
-        results = rst_futures.get()
-    except Exception as e:
-        raise RuntimeError(f"Failed to complete distributed compaction: {e}") from e
-    finally:
-        pool.close()
 
     # Check for failures
     failed_results = [r for r in results if r["status"] == "error"]
     if failed_results:
-        error_messages = [r["error"] for r in failed_results]
+        error_messages = []
+        for r in failed_results:
+            for err in r["errors"]:
+                error_messages.append(
+                    f"fragments {err['fragments']}: {err['error']}"
+                )
         raise RuntimeError(f"Compaction failed: {'; '.join(error_messages)}")
 
-    # Step 3: Collect successful RewriteResult objects
-    successful_results = [r for r in results if r["status"] == "success"]
-    if not successful_results:
-        raise RuntimeError("No successful compaction results found")
-
-    rewrites = [r["result"] for r in successful_results]
+    # Step 3: Collect successful RewriteResult objects from all batches
+    rewrites = []
+    for r in results:
+        rewrites.extend(r["results"])
 
     logger.info(
         f"Collected {len(rewrites)} successful compaction results, committing..."
